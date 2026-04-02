@@ -1,23 +1,32 @@
 """
 FPGA Interface Layer
-Handles AXI communication between ARM CPU and FPGA hardware
+Handles communication between the PS (ARM CPU) and PL (FPGA logic).
 
-Memory Map (24-bit address space):
-- 0x000000: Control register (RW)
-- 0x000004: Status register (RO)
-- 0x000100: Input image buffer (W) - 1280x720 RGB (1.2MB)
-- 0x200000: Output image buffer (R) - 1.2MB
-- 0x400000: Face detection results (R) - up to 16 faces (1KB)
-- 0x404000: CNN embeddings (R) - 16 faces * 128 * 4 bytes (8KB)
+Responsibilities:
+  - Load the bitstream and configure the HDMI IN/OUT video pipeline
+  - Write the 1-bit authorization flag to AXI GPIO → PL kill-switch mux
+  - Feed camera frames to the VDMA so they appear on HDMI OUT when unauthorized
+
+PL Block Design components accessed here:
+  - axi_gpio_0  : AXI GPIO IP, 1-bit output, GPIO_DATA[0] = auth_flag
+  - axi_vdma_0  : AXI VDMA, MM2S channel streams frames from DDR → PL
+  - video_in    : PYNQ VideoIn  (dvi2rgb + HDMI RX)  — HDMI IN capture
+  - video_out   : PYNQ VideoOut (rgb2dvi + HDMI TX)  — HDMI OUT display
+
+Note: the Vivado block design exports an .hwh hardware description file that
+PYNQ parses to automatically name the IP instances.  The attribute names used
+below (overlay.axi_gpio_0, overlay.axi_vdma_0) must match the block-design
+instance names set in create_project.tcl.
 """
 
 import numpy as np
 import logging
-from typing import Tuple, Optional
 import time
+from typing import Optional
 
 try:
-    from pynq import allocate, MMIO
+    from pynq import Overlay, allocate
+    from pynq.lib.video import VideoIn, VideoOut, PIXEL_RGB
     PYNQ_AVAILABLE = True
 except ImportError:
     PYNQ_AVAILABLE = False
@@ -25,286 +34,156 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# AXI GPIO register offsets (Xilinx AXI GPIO v2 IP)
+_GPIO_DATA_OFFSET = 0x000   # Channel 1 data register
+
+
 class FPGAInterface:
-    """Interface to FPGA accelerator via AXI"""
-    
-    def __init__(self, overlay, verbose=False):
+    """
+    Thin PS↔PL interface.
+
+    After init the HDMI pipeline is running continuously in hardware:
+      - Unauthorized: VDMA camera frames → HDMI OUT
+      - Authorized:   HDMI IN passthrough → HDMI OUT
+    The PS only needs to update the 1-bit GPIO flag each recognition cycle.
+    """
+
+    def __init__(self, overlay, verbose: bool = False):
         """
-        Initialize FPGA interface
-        
         Args:
-            overlay: PYNQ Overlay object (from loaded bitstream)
+            overlay: Loaded pynq.Overlay object
             verbose: Enable debug logging
         """
         self.overlay = overlay
         self.verbose = verbose
-        
-        # AXI parameters (must match hardware)
-        self.BASE_ADDR = 0x40000000  # AXI4 slave base address
-        self.INPUT_IMG_ADDR = 0x000100
-        self.OUTPUT_IMG_ADDR = 0x200000
-        self.FACES_ADDR = 0x400000
-        self.EMBEDDINGS_ADDR = 0x404000
-        
-        self.CTRL_REG = 0x000000
-        self.STATUS_REG = 0x000004
-        
-        # Image dimensions
-        self.IMAGE_WIDTH = 1280
-        self.IMAGE_HEIGHT = 720
-        self.IMAGE_SIZE = self.IMAGE_WIDTH * self.IMAGE_HEIGHT
-        
-        # Embedding parameters
-        self.EMBEDDING_DIM = 128
-        self.MAX_FACES = 16
-        
-        # Initialize AXI memory interface
-        self._init_axi()
-        
-        logger.info("FPGA interface initialized")
-    
-    def _init_axi(self):
-        """Initialize AXI memory interface"""
-        if PYNQ_AVAILABLE:
-            try:
-                # Create MMIO interface to FPGA registers and memory
-                self.mmio = MMIO(self.BASE_ADDR, 0x500000)  # 5MB address space
-                logger.info(f"AXI memory interface created at 0x{self.BASE_ADDR:08X}")
-            except Exception as e:
-                logger.error(f"Failed to initialize AXI interface: {e}")
-                raise
-        else:
-            logger.warning("PYNQ not available - MMIO disabled")
-            self.mmio = None
-    
-    def process_frame(self, frame: np.ndarray) -> Optional[Tuple]:
-        """
-        Send frame to FPGA for processing
-        
-        Args:
-            frame (np.ndarray): Input frame (BGR, 1280x720, uint8)
-        
-        Returns:
-            Tuple[faces, embeddings] or None if processing failed
-            - faces: List of (x1, y1, x2, y2) bounding boxes
-            - embeddings: List of 128-D embeddings (normalized unit vectors)
-        """
-        if frame.shape != (self.IMAGE_HEIGHT, self.IMAGE_WIDTH, 3):
-            logger.warning(f"Unexpected frame shape: {frame.shape}")
-            return None
-        
-        try:
-            # 1. Convert BGR to RGB and write to input buffer
-            self._write_image_to_fpga(frame)
-            
-            # 2. Trigger detection and embedding computation
-            self._start_processing()
-            
-            # 3. Wait for completion
-            if not self._wait_for_completion(timeout=1.0):
-                logger.warning("FPGA processing timeout")
-                return None
-            
-            # 4. Read results
-            faces, embeddings = self._read_results()
-            
-            if self.verbose:
-                logger.debug(f"Detected {len(faces)} faces")
-            
-            return faces, embeddings
-        
-        except Exception as e:
-            logger.error(f"Frame processing error: {e}")
-            return None
-    
-    def _write_image_to_fpga(self, frame: np.ndarray):
-        """Write image frame to FPGA input buffer via AXI"""
-        if not PYNQ_AVAILABLE or not self.mmio:
+        self._authorized = False
+
+        self._init_gpio()
+        self._init_video()
+
+        # Start in unauthorized state (safe default: block PC signal)
+        self.set_authorization_status(False)
+        logger.info("FPGA interface ready — HDMI pipeline active")
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    def _init_gpio(self):
+        """Bind to the AXI GPIO IP that drives the kill-switch auth_flag."""
+        if not PYNQ_AVAILABLE:
+            self._gpio = None
             return
-        
         try:
-            # Convert BGR to RGB (flip channels)
-            rgb_frame = frame[:, :, ::-1]  # BGR -> RGB
-            
-            # Flatten image data
-            flat_pixels = rgb_frame.reshape(-1)
-            
-            # Pack RGB pixels (3 bytes per pixel) into 32-bit words
-            # FPGA expects pixels as: [B,G,R,X] in 32-bit words
-            pixel_words = np.zeros(self.IMAGE_SIZE, dtype=np.uint32)
-            
-            for i in range(self.IMAGE_SIZE):
-                idx = i * 3
-                r = flat_pixels[idx] if idx < len(flat_pixels) else 0
-                g = flat_pixels[idx+1] if idx+1 < len(flat_pixels) else 0
-                b = flat_pixels[idx+2] if idx+2 < len(flat_pixels) else 0
-                pixel_words[i] = (r << 16) | (g << 8) | b
-            
-            # Write to FPGA memory
-            addr = self.BASE_ADDR + self.INPUT_IMG_ADDR
-            self.mmio.write_region(addr, pixel_words.tobytes())
-            
-            if self.verbose:
-                logger.debug(f"Image written to FPGA (0x{addr:X})")
-        
-        except Exception as e:
-            logger.error(f"Failed to write image: {e}")
+            # PYNQ auto-discovers IP instances from the .hwh file.
+            # The GPIO IP is configured as 1-bit output-only in the block design.
+            self._gpio = self.overlay.axi_gpio_0
+            logger.info("AXI GPIO bound (auth_flag control)")
+        except AttributeError:
+            logger.error(
+                "axi_gpio_0 not found in overlay — check block design instance name"
+            )
             raise
-    
-    def _start_processing(self):
-        """Trigger FPGA face detection and CNN embedding computation"""
-        if not PYNQ_AVAILABLE or not self.mmio:
+
+    def _init_video(self):
+        """Configure HDMI IN capture and HDMI OUT display via PYNQ video API."""
+        if not PYNQ_AVAILABLE:
+            self._hdmi_in = None
+            self._hdmi_out = None
             return
-        
         try:
-            # Write control register: bit[0]=detect_enable, bit[1]=cnn_enable
-            ctrl = 0x03  # Enable both detection and CNN
-            self.mmio.write(self.BASE_ADDR + self.CTRL_REG, ctrl)
-            
-            if self.verbose:
-                logger.debug("FPGA processing started")
-        
-        except Exception as e:
-            logger.error(f"Failed to start processing: {e}")
+            # VideoIn wraps the dvi2rgb IP + video timing controller
+            self._hdmi_in = self.overlay.video.hdmi_in
+            self._hdmi_in.configure(PIXEL_RGB)
+            self._hdmi_in.start()
+
+            # VideoOut wraps the rgb2dvi IP + video timing controller
+            # Match the input mode (resolution + pixel format) automatically
+            self._hdmi_out = self.overlay.video.hdmi_out
+            self._hdmi_out.configure(self._hdmi_in.mode, PIXEL_RGB)
+            self._hdmi_out.start()
+
+            logger.info(
+                f"HDMI IN/OUT configured: {self._hdmi_in.mode.width}x"
+                f"{self._hdmi_in.mode.height} @ {self._hdmi_in.mode.fps} fps"
+            )
+        except AttributeError as e:
+            logger.error(f"HDMI video init failed: {e}")
             raise
-    
-    def _wait_for_completion(self, timeout: float = 1.0) -> bool:
-        """
-        Wait for FPGA to complete processing
-        
-        Args:
-            timeout: Timeout in seconds
-        
-        Returns:
-            True if completed within timeout, False otherwise
-        """
-        if not PYNQ_AVAILABLE or not self.mmio:
-            # Mock: simulate processing
-            time.sleep(0.03)  # ~30ms for one frame
-            return True
-        
-        start_time = time.time()
-        
-        while (time.time() - start_time) < timeout:
-            # Read status register
-            status = self.mmio.read(self.BASE_ADDR + self.STATUS_REG)
-            
-            # Bit 8 = detection_complete, Bit 9 = embedding_complete
-            detection_done = (status >> 8) & 0x1
-            embedding_done = (status >> 9) & 0x1
-            
-            if detection_done and embedding_done:
-                if self.verbose:
-                    logger.debug("FPGA processing completed")
-                return True
-            
-            time.sleep(0.001)  # Poll every 1ms
-        
-        logger.warning(f"FPGA processing timeout (status: 0x{status:08X})")
-        return False
-    
-    def _read_results(self) -> Tuple:
-        """
-        Read face detection and embedding results from FPGA
-        
-        Returns:
-            (faces, embeddings) tuple
-            - faces: List of (x1, y1, x2, y2) tuples
-            - embeddings: List of 128-D numpy arrays
-        """
-        faces = []
-        embeddings = []
-        
-        if not PYNQ_AVAILABLE or not self.mmio:
-            # Return mock results for testing
-            faces.append((400, 200, 500, 300))  # Dummy face
-            embeddings.append(np.random.randn(self.EMBEDDING_DIM).astype(np.float32))
-            return faces, embeddings
-        
-        try:
-            # Read status to get number of faces
-            status = self.mmio.read(self.BASE_ADDR + self.STATUS_REG)
-            num_faces = status & 0xFF
-            
-            if self.verbose:
-                logger.debug(f"Reading {num_faces} faces from FPGA")
-            
-            # Read face bounding boxes
-            addr_faces = self.BASE_ADDR + self.FACES_ADDR
-            face_data = self.mmio.read_region(addr_faces, num_faces * 8)
-            
-            for i in range(num_faces):
-                offset = i * 8
-                x1 = int.from_bytes(face_data[offset:offset+2], 'little')
-                y1 = int.from_bytes(face_data[offset+2:offset+4], 'little')
-                x2 = int.from_bytes(face_data[offset+4:offset+6], 'little')
-                y2 = int.from_bytes(face_data[offset+6:offset+8], 'little')
-                
-                faces.append((x1, y1, x2, y2))
-            
-            # Read CNN embeddings (INT8 quantized, 128-D per face)
-            addr_emb = self.BASE_ADDR + self.EMBEDDINGS_ADDR
-            emb_data = self.mmio.read_region(addr_emb, num_faces * self.EMBEDDING_DIM)
-            
-            for i in range(num_faces):
-                offset = i * self.EMBEDDING_DIM
-                # Read as INT8, convert to float, normalize
-                emb_int8 = np.frombuffer(
-                    emb_data[offset:offset+self.EMBEDDING_DIM],
-                    dtype=np.int8
-                )
-                
-                # Dequantize: INT8 -> Float
-                emb_float = emb_int8.astype(np.float32) / 127.0
-                
-                # Normalize to unit length
-                norm = np.linalg.norm(emb_float) + 1e-8
-                emb_normalized = emb_float / norm
-                
-                embeddings.append(emb_normalized)
-            
-            return faces, embeddings
-        
-        except Exception as e:
-            logger.error(f"Failed to read results: {e}")
-            return [], []
-    
+
+    # ------------------------------------------------------------------
+    # Kill-switch control
+    # ------------------------------------------------------------------
+
     def set_authorization_status(self, is_authorized: bool):
         """
-        Send authorization status to FPGA kill switch
-        
+        Set the kill-switch state.
+
+        Writes a single bit to AXI GPIO DATA register.  The PL hdmi_stream_mux
+        samples this flag at the next frame boundary and routes accordingly.
+
         Args:
-            is_authorized (bool): True = pass through computer HDMI, 
-                                   False = show camera feed
+            is_authorized: True  → pass HDMI IN to HDMI OUT (PC signal visible)
+                           False → show camera feed on HDMI OUT (PC signal blocked)
         """
+        self._authorized = is_authorized
+
+        if not PYNQ_AVAILABLE or self._gpio is None:
+            status = "AUTHORIZED" if is_authorized else "UNAUTHORIZED"
+            logger.info(f"[Mock] Kill-switch → {status}")
+            return
+
         try:
-            if not PYNQ_AVAILABLE or not self.mmio:
-                if is_authorized:
-                    logger.info("[Mock] Authorization status set to AUTHORIZED")
-                else:
-                    logger.info("[Mock] Authorization status set to UNAUTHORIZED")
-                return
-            
-            # Write authorization bit to control register (bit 2)
-            # bit[0] = detect_enable
-            # bit[1] = cnn_enable  
-            # bit[2] = is_authorized (kill switch control)
-            
-            ctrl_value = 0x07 if is_authorized else 0x03  # bits 0,1 always on, bit 2 for auth
-            self.mmio.write(self.BASE_ADDR + self.CTRL_REG, ctrl_value)
-            
-            status_str = "AUTHORIZED ✓" if is_authorized else "UNAUTHORIZED ✗"
-            logger.debug(f"FPGA kill switch set to: {status_str} (ctrl=0x{ctrl_value:02X})")
-            
+            # AXI GPIO channel-1 data register: write 1 or 0 to bit[0]
+            self._gpio.write(_GPIO_DATA_OFFSET, int(is_authorized))
+
+            if self.verbose:
+                logger.debug(
+                    f"GPIO auth_flag = {int(is_authorized)} "
+                    f"({'AUTHORIZED' if is_authorized else 'UNAUTHORIZED'})"
+                )
         except Exception as e:
             logger.error(f"Failed to set authorization status: {e}")
-    
-    def shutdown(self):
-        """Shutdown FPGA interface"""
+
+    # ------------------------------------------------------------------
+    # Camera frame injection (for VDMA path)
+    # ------------------------------------------------------------------
+
+    def write_camera_frame(self, frame: np.ndarray):
+        """
+        Write a camera frame into the VDMA frame buffer so it appears on
+        HDMI OUT while the system is in the unauthorized state.
+
+        The VDMA continuously re-reads the last written frame, so this only
+        needs to be called when a new camera frame is available.
+
+        Args:
+            frame: BGR frame from OpenCV (H×W×3, uint8).
+                   Will be converted to RGB before writing.
+        """
+        if not PYNQ_AVAILABLE or self._hdmi_out is None:
+            return
         try:
-            if PYNQ_AVAILABLE and self.mmio:
-                # Clear control register
-                self.mmio.write(self.BASE_ADDR + self.CTRL_REG, 0x00)
-                logger.info("FPGA interface shutdown")
+            out_frame = self._hdmi_out.newframe()
+            # Convert BGR (OpenCV) → RGB (HDMI), copy into PYNQ contiguous buffer
+            out_frame[:] = frame[:, :, ::-1]
+            self._hdmi_out.writeframe(out_frame)
+        except Exception as e:
+            logger.error(f"Failed to write camera frame: {e}")
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def shutdown(self):
+        """Stop HDMI pipeline and set kill-switch to unauthorized (safe state)."""
+        try:
+            self.set_authorization_status(False)
+            if PYNQ_AVAILABLE:
+                if self._hdmi_in:
+                    self._hdmi_in.stop()
+                if self._hdmi_out:
+                    self._hdmi_out.stop()
+            logger.info("FPGA interface shutdown")
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")

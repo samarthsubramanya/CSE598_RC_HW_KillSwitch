@@ -1,13 +1,21 @@
 """
-PYNQ-Z2 Face Recognition System
-Main orchestration script
+PYNQ-Z2 Face Recognition Kill Switch — Main Orchestration
 
-Workflow:
-1. Load FPGA bitstream
-2. Connect to network camera (mobile phone via Camo)
-3. Stream video to FPGA for face detection and embedding
-4. Perform recognition matching
-5. Stream output with overlays to HDMI
+System flow:
+  1. Load FPGA bitstream (custom overlay with AXI GPIO + VDMA + HDMI mux)
+  2. Connect to mobile phone camera via DroidCam network stream
+  3. Each frame:
+       a. Run face detection + embedding on PS (face_recognition library)
+       b. Match embeddings against enrolled user database (cosine similarity)
+       c. Update kill-switch state via 1-bit AXI GPIO write to FPGA
+       d. Push annotated camera frame to VDMA frame buffer (shown when unauthorized)
+  4. FPGA PL continuously routes:
+       auth=1 → HDMI IN (PC signal) → HDMI OUT  (access granted)
+       auth=0 → camera feed → HDMI OUT           (access denied)
+
+Usage:
+  python main.py --mode recognition --bitstream design_1.bit
+  python main.py --mode enroll --user alice --bitstream design_1.bit
 """
 
 import numpy as np
@@ -21,19 +29,17 @@ from collections import deque
 from typing import Optional
 
 try:
-    from pynq import Bitstream, Overlay, allocate
-    from pynq.gpio import GPIO
+    from pynq import Overlay
     PYNQ_AVAILABLE = True
 except ImportError:
     PYNQ_AVAILABLE = False
-    print("Warning: PYNQ not available. Using mock FPGA interface.")
+    print("Warning: PYNQ not available — using mock FPGA interface.")
 
 from fpga_interface import FPGAInterface
 from camera_interface import NetworkCamera, USBCamera
-from recognition import FaceRecognizer, AuthStatus
-from user_db import UserDatabase
+from recognition import PSFaceProcessor, FaceRecognizer, AuthStatus, UserDatabase
+from hdmi_overlay import OverlayGenerator
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
@@ -42,372 +48,286 @@ logger = logging.getLogger(__name__)
 
 
 class FaceRecognitionSystem:
-    """Main system orchestrator for PYNQ-Z2"""
-    
-    def __init__(self, bitstream_path, camera_source="phone", verbose=False):
-        """
-        Initialize face recognition system
-        
-        Args:
-            bitstream_path (str): Path to compiled FPGA bitstream (.bit or .xsa)
-            camera_source (str): "phone" for network camera or USB device path
-            verbose (bool): Enable debug logging
-        """
+    """Main system orchestrator for PYNQ-Z2."""
+
+    def __init__(self, bitstream_path: str, camera_source: str = "phone",
+                 verbose: bool = False):
         self.bitstream_path = Path(bitstream_path)
-        self.camera_source = camera_source
-        self.verbose = verbose
-        
-        # Components
-        self.fpga = None
-        self.camera = None
+        self.camera_source  = camera_source
+        self.verbose        = verbose
+
+        self.fpga       = None
+        self.camera     = None
+        self.processor  = None   # PSFaceProcessor
         self.recognizer = None
-        self.db = None
-        
-        # State
-        self.running = False
-        self.mode = "recognition"  # "recognition" or "enrollment"
+        self.db         = None
+        self.overlay_gen = OverlayGenerator()
+
+        self.running      = False
+        self.mode         = "recognition"
         self.current_user = None
-        
-        # Performance metrics
-        self.frame_count = 0
-        self.fps_history = deque(maxlen=60)
-        
-        logger.info(f"Initializing Face Recognition System")
-        logger.info(f"Bitstream: {self.bitstream_path}")
-        logger.info(f"Camera source: {camera_source}")
-    
+        self.frame_count  = 0
+
+        logger.info(f"Face Recognition Kill Switch")
+        logger.info(f"Bitstream: {self.bitstream_path} | Camera: {camera_source}")
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
     def setup(self):
-        """Initialize all system components"""
-        logger.info("Setting up FPGA...")
+        """Initialize all components."""
+        logger.info("Loading bitstream and starting HDMI pipeline...")
         self._setup_fpga()
-        
-        logger.info("Setting up camera...")
+
+        logger.info("Connecting to camera...")
         self._setup_camera()
-        
+
         logger.info("Loading user database...")
         self.db = UserDatabase("data/users.json")
-        
+
         logger.info("Initializing face recognizer...")
+        self.processor  = PSFaceProcessor(detection_model="hog")
         self.recognizer = FaceRecognizer(self.db, similarity_threshold=0.6)
-        
-        logger.info("✅ System setup complete")
-    
+
+        logger.info("System ready")
+
     def _setup_fpga(self):
-        """Load FPGA bitstream and initialize hardware"""
-        
         if not PYNQ_AVAILABLE:
-            logger.warning("PYNQ not available - using mock FPGA interface")
-            self.fpga = MockFPGAInterface()
+            logger.warning("PYNQ unavailable — using mock interface")
+            self.fpga = _MockFPGAInterface()
             return
-        
+
         if not self.bitstream_path.exists():
             raise FileNotFoundError(f"Bitstream not found: {self.bitstream_path}")
-        
-        try:
-            # Load bitstream onto FPGA
-            overlay = Overlay(str(self.bitstream_path))
-            logger.info(f"Bitstream loaded successfully")
-            
-            # Initialize FPGA interface (AXI communication)
-            self.fpga = FPGAInterface(overlay, verbose=self.verbose)
-            logger.info("FPGA interface initialized")
-            
-        except Exception as e:
-            logger.error(f"Failed to load bitstream: {e}")
-            raise
-    
+
+        overlay = Overlay(str(self.bitstream_path))
+        logger.info("Bitstream loaded")
+        self.fpga = FPGAInterface(overlay, verbose=self.verbose)
+
     def _setup_camera(self):
-        """Initialize camera input"""
-        
         if self.camera_source == "phone":
-            # Network camera (mobile phone via Camo or similar)
+            # DroidCam default network URL — update IP to match your phone
             self.camera = NetworkCamera(
-                url="http://127.0.0.1:9095/video",  # Default Camo URL
+                url="http://192.168.1.100:4747/video",
                 resolution=(1280, 720),
                 fps=30
             )
-            logger.info("Using network camera (mobile phone)")
+            logger.info("Network camera (DroidCam)")
         else:
-            # USB camera
             self.camera = USBCamera(
                 device=self.camera_source,
                 resolution=(1280, 720),
                 fps=30
             )
-            logger.info(f"Using USB camera: {self.camera_source}")
-        
+            logger.info(f"USB camera: {self.camera_source}")
+
         if not self.camera.connect():
             raise RuntimeError("Failed to connect to camera")
-        
         logger.info(f"Camera connected: {self.camera.resolution}")
-    
+
+    # ------------------------------------------------------------------
+    # Recognition loop
+    # ------------------------------------------------------------------
+
     def run_recognition(self):
-        """Main recognition loop"""
-        logger.info("Starting recognition mode")
-        self.mode = "recognition"
+        """Continuous recognition → kill-switch control loop."""
+        logger.info("Recognition mode started")
+        self.mode    = "recognition"
         self.running = True
-        
+
         try:
             while self.running:
-                # ===== CHECK FOR ENROLLMENT REQUEST FILE =====
+                # Check for file-based enrollment request
                 if self._check_enrollment_request():
                     username = self._load_enrollment_request()
                     if username:
-                        logger.info(f"📝 Enrollment request detected for user: {username}")
+                        logger.info(f"Enrollment request: {username}")
                         self.run_enrollment(username)
                         self._delete_enrollment_request()
-                        logger.info(f"✅ Enrollment complete, resuming recognition...")
+                        logger.info("Resuming recognition...")
                     continue
-                
-                # ===== NORMAL RECOGNITION FLOW =====
-                # Capture frame from camera
+
                 frame = self.camera.read_frame()
                 if frame is None:
-                    logger.warning("Failed to read frame")
                     continue
-                
-                # Send to FPGA for face detection and embedding
-                result = self.fpga.process_frame(frame)
-                
-                if result is None:
-                    logger.warning("FPGA processing failed")
-                    continue
-                
-                faces, embeddings = result
-                
-                # Perform recognition matching
-                recognition_results = []
-                for i, (face_box, embedding) in enumerate(zip(faces, embeddings)):
-                    status = self.recognizer.recognize(embedding)
-                    recognition_results.append((face_box, status))
-                
-                # Send authorization status to FPGA (kill switch control)
-                # FPGA will multiplex: if authorized → pass through computer HDMI
-                #                      if not authorized → show camera feed
+
+                # PS-side face detection + embedding (replaces FPGA CNN/Haar)
+                faces, embeddings = self.processor.process_frame(frame)
+
+                # Match each detected face against the user database
+                recognition_results = [
+                    (box, self.recognizer.recognize(emb))
+                    for box, emb in zip(faces, embeddings)
+                ]
+
+                # Authorization decision → FPGA kill switch
                 is_authorized = (self.recognizer.current_status == AuthStatus.AUTHORIZED)
                 self.fpga.set_authorization_status(is_authorized)
-                
-                if is_authorized:
-                    logger.info("✓ AUTHORIZED - Passing computer HDMI to monitor")
-                else:
-                    logger.debug("✗ NOT AUTHORIZED - Showing camera feed on monitor")
-                
-                # Update metrics
-                self.frame_count += 1
-                if self.frame_count % 60 == 0:
-                    logger.info(f"Processed {self.frame_count} frames")
-        
-        except KeyboardInterrupt:
-            logger.info("Recognition interrupted by user")
-        finally:
-            self.cleanup()
-    
-    def run_enrollment(self, username):
-        """Enrollment mode: capture face samples"""
-        logger.info(f"Starting enrollment for user: {username}")
-        self.mode = "enrollment"
-        self.current_user = username
-        self.running = True
-        
-        samples = []
-        required_samples = 15
-        
-        try:
-            while len(samples) < required_samples and self.running:
-                # Capture frame
-                frame = self.camera.read_frame()
-                if frame is None:
-                    continue
-                
-                # Detect and compute embedding
-                result = self.fpga.process_frame(frame)
-                if result is None:
-                    logger.warning("Face not detected")
-                    continue
-                
-                faces, embeddings = result
-                
-                if len(faces) == 0:
-                    logger.info("No face detected")
-                    continue
-                
-                if len(faces) > 1:
-                    logger.warning("Multiple faces detected - using first face")
-                
-                # Store embedding
-                embedding = embeddings[0]
-                samples.append(embedding)
-                logger.info(f"Captured {len(samples)}/{required_samples} samples")
-                
-                # Show progress
-                display_frame = frame.copy()
-                cv2.putText(
-                    display_frame,
-                    f"Enrollment: {len(samples)}/{required_samples}",
-                    (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 255, 0),
-                    2
+
+                # Push annotated camera frame to VDMA (displayed when unauthorized)
+                annotated = self.overlay_gen.draw_boxes_and_status(
+                    frame, recognition_results, embeddings
                 )
-                self._display_frame(display_frame)
-            
-            if len(samples) == required_samples:
-                # Average embeddings
-                avg_embedding = np.mean(samples, axis=0)
-                avg_embedding = avg_embedding / (np.linalg.norm(avg_embedding) + 1e-8)
-                
-                # Store in database
-                self.db.add_user(username, avg_embedding)
-                logger.info(f"✅ Successfully enrolled {username}")
-            else:
-                logger.info("Enrollment cancelled")
-        
+                self.fpga.write_camera_frame(annotated)
+
+                if is_authorized:
+                    logger.debug("AUTHORIZED — HDMI IN passthrough active")
+                else:
+                    logger.debug("UNAUTHORIZED — camera feed on display")
+
+                self.frame_count += 1
+                if self.frame_count % 100 == 0:
+                    logger.info(f"Frames processed: {self.frame_count}")
+
         except KeyboardInterrupt:
-            logger.info("Enrollment interrupted")
+            logger.info("Stopped by user")
         finally:
             self.cleanup()
-    
-    def _display_frame(self, frame):
-        """Display frame on HDMI output"""
-        # HDMI output is handled by FPGA
-        # This function can be used for debugging on monitor if available
-        if self.verbose:
-            cv2.imshow("Face Recognition", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                self.running = False
-    
-    # =====================================================================
-    # FILE-BASED ENROLLMENT (for continuous FPGA operation)
-    # =====================================================================
-    
+
+    # ------------------------------------------------------------------
+    # Enrollment
+    # ------------------------------------------------------------------
+
+    def run_enrollment(self, username: str, required_samples: int = 15):
+        """
+        Capture face samples and store the averaged embedding for a new user.
+
+        Args:
+            username:         Name to store in the database.
+            required_samples: Number of frames to average (more = more robust).
+        """
+        logger.info(f"Enrolling user: {username}")
+        self.mode         = "enrollment"
+        self.current_user = username
+        samples = []
+
+        while len(samples) < required_samples and self.running:
+            frame = self.camera.read_frame()
+            if frame is None:
+                continue
+
+            faces, embeddings = self.processor.process_frame(frame)
+
+            if len(faces) == 0:
+                logger.info("No face detected — move into frame")
+                continue
+            if len(faces) > 1:
+                logger.warning("Multiple faces — please ensure only one person is visible")
+                continue
+
+            samples.append(embeddings[0])
+            progress = len(samples)
+            logger.info(f"Sample {progress}/{required_samples}")
+
+            # Show progress on the VDMA output
+            display = frame.copy()
+            cv2.putText(
+                display,
+                f"Enrolling {username}: {progress}/{required_samples}",
+                (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2
+            )
+            cv2.rectangle(display, (faces[0][0], faces[0][1]),
+                          (faces[0][2], faces[0][3]), (0, 255, 0), 2)
+            self.fpga.write_camera_frame(display)
+
+        if len(samples) == required_samples:
+            avg = np.mean(samples, axis=0).astype(np.float32)
+            norm = np.linalg.norm(avg)
+            if norm > 1e-8:
+                avg = avg / norm
+            self.db.add_user(username, avg)
+            logger.info(f"Enrolled '{username}' successfully")
+        else:
+            logger.info("Enrollment cancelled")
+
+    # ------------------------------------------------------------------
+    # File-based enrollment trigger (drop enroll_request.json while running)
+    # ------------------------------------------------------------------
+
     def _check_enrollment_request(self) -> bool:
-        """Check if enrollment request file exists"""
-        enroll_file = Path("enroll_request.json")
-        return enroll_file.exists()
-    
+        return Path("enroll_request.json").exists()
+
     def _load_enrollment_request(self) -> Optional[str]:
-        """Load username from enrollment request file"""
         try:
-            enroll_file = Path("enroll_request.json")
-            if not enroll_file.exists():
-                return None
-            
-            with open(enroll_file, 'r') as f:
-                data = json.load(f)
-            
-            username = data.get("username")
-            logger.info(f"Loaded enrollment request for: {username}")
-            return username
-        
+            with open("enroll_request.json", 'r') as f:
+                return json.load(f).get("username")
         except Exception as e:
-            logger.error(f"Failed to load enrollment request: {e}")
+            logger.error(f"Failed to read enrollment request: {e}")
             return None
-    
+
     def _delete_enrollment_request(self):
-        """Delete enrollment request file"""
         try:
-            enroll_file = Path("enroll_request.json")
-            if enroll_file.exists():
-                enroll_file.unlink()
-                logger.info("Enrollment request file deleted")
+            Path("enroll_request.json").unlink(missing_ok=True)
         except Exception as e:
             logger.error(f"Failed to delete enrollment request: {e}")
-    
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
     def cleanup(self):
-        """Shutdown system gracefully"""
         logger.info("Shutting down...")
         self.running = False
-        
         if self.camera:
             self.camera.disconnect()
-        
         if self.fpga:
             self.fpga.shutdown()
-        
         cv2.destroyAllWindows()
-        logger.info("System shutdown complete")
+        logger.info("Shutdown complete")
 
 
-class MockFPGAInterface:
-    """Mock FPGA interface for testing without PYNQ"""
-    
+# ======================================================================
+# Mock interface for development without PYNQ hardware
+# ======================================================================
+
+class _MockFPGAInterface:
+    """Simulates the FPGA interface for off-board testing."""
+
     def __init__(self):
-        logger.warning("Using mock FPGA interface - no hardware acceleration")
-        self.detector = None
-        self.embedder = None
-        self._init_mock_models()
-    
-    def _init_mock_models(self):
-        """Initialize mock face detector and embedder"""
-        # This would use CPU-based models for testing
-        pass
-    
-    def process_frame(self, frame):
-        """Mock frame processing"""
-        # For testing: return dummy results
-        return [], np.array([])
-    
+        logger.warning("Mock FPGA interface active (no hardware)")
+
     def set_authorization_status(self, is_authorized: bool):
-        """Mock authorization status update"""
-        status_str = "AUTHORIZED ✓" if is_authorized else "UNAUTHORIZED ✗"
-        logger.info(f"[Mock] Kill switch set to: {status_str}")
-    
+        logger.info(f"[Mock] Kill-switch → {'AUTHORIZED' if is_authorized else 'UNAUTHORIZED'}")
+
+    def write_camera_frame(self, frame: np.ndarray):
+        # Show the annotated frame locally for debugging
+        cv2.imshow("Camera Feed (Mock)", cv2.resize(frame, (640, 360)))
+        cv2.waitKey(1)
+
     def shutdown(self):
-        pass
+        cv2.destroyAllWindows()
 
 
-# =====================================================================
-# Command Line Interface
-# =====================================================================
+# ======================================================================
+# CLI
+# ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="PYNQ-Z2 Face Recognition System"
-    )
-    parser.add_argument(
-        "--bitstream",
-        type=str,
-        default="design_1.bit",
-        help="Path to FPGA bitstream file"
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["recognition", "enroll"],
-        default="recognition",
-        help="Operating mode"
-    )
-    parser.add_argument(
-        "--user",
-        type=str,
-        help="Username for enrollment"
-    )
-    parser.add_argument(
-        "--camera",
-        type=str,
-        default="phone",
-        help='Camera source: "phone" or USB device path'
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug output"
-    )
-    
+    parser = argparse.ArgumentParser(description="PYNQ-Z2 Face Recognition Kill Switch")
+    parser.add_argument("--bitstream", default="design_1.bit",
+                        help="Path to FPGA bitstream (.bit file)")
+    parser.add_argument("--mode", choices=["recognition", "enroll"],
+                        default="recognition")
+    parser.add_argument("--user", help="Username for enrollment mode")
+    parser.add_argument("--camera", default="phone",
+                        help='"phone" for DroidCam network stream, or USB device path')
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    
-    # Create system
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     system = FaceRecognitionSystem(
         bitstream_path=args.bitstream,
         camera_source=args.camera,
-        verbose=args.verbose
+        verbose=args.verbose,
     )
-    
+
     try:
-        # Setup
         system.setup()
-        
-        # Run appropriate mode
+        system.running = True
+
         if args.mode == "recognition":
             system.run_recognition()
         elif args.mode == "enroll":
@@ -415,9 +335,9 @@ def main():
                 print("Error: --user required for enrollment mode")
                 sys.exit(1)
             system.run_enrollment(args.user)
-    
+
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal: {e}")
         sys.exit(1)
 
 

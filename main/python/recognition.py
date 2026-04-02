@@ -1,243 +1,278 @@
 """
 Face Recognition Module
-Performs embedding matching and manages authorization state
+
+Two distinct responsibilities:
+  1. PSFaceProcessor  — detects faces and computes 128-D embeddings on the PS (ARM)
+                        using the face_recognition library (dlib + ResNet-34).
+  2. FaceRecognizer   — matches embeddings against the UserDatabase and maintains
+                        the hysteresis authorization state machine.
+  3. UserDatabase     — persistent JSON store for enrolled user embeddings.
+
+The 128-D float32 embeddings produced by PSFaceProcessor are L2-normalized and
+compatible with the UserDatabase format.  FaceRecognizer is unchanged from the
+original design — it only sees numpy vectors regardless of how they were computed.
 """
 
 import numpy as np
 import logging
-from typing import Optional
+import cv2
+import json
+from typing import List, Tuple, Optional
 from collections import deque
 from enum import Enum
+from pathlib import Path
+
+try:
+    import face_recognition as fr
+    FR_AVAILABLE = True
+except ImportError:
+    FR_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "face_recognition not installed — install with: pip install face-recognition"
+    )
 
 logger = logging.getLogger(__name__)
 
 
+# =====================================================================
+# PS-side face processor (replaces FPGA CNN + Haar)
+# =====================================================================
+
+class PSFaceProcessor:
+    """
+    Detects faces and computes 128-D embeddings entirely on the ARM CPU.
+
+    Uses the face_recognition library which wraps dlib:
+      - Detection: HOG-based detector (fast, good for frontal faces)
+      - Embedding: ResNet-34 model → 128-D unit-norm vector
+
+    The embedding format is identical to what the original FPGA CNN was
+    intended to produce, so UserDatabase and FaceRecognizer are unchanged.
+    """
+
+    def __init__(self, detection_model: str = "hog"):
+        """
+        Args:
+            detection_model: "hog" (faster, CPU-friendly) or "cnn" (more accurate,
+                             uses dlib's CNN — slower on Cortex-A9).
+                             "hog" is recommended for real-time on PYNQ-Z2.
+        """
+        if not FR_AVAILABLE:
+            raise ImportError(
+                "face_recognition library is required. "
+                "Install: pip install face-recognition"
+            )
+        self.detection_model = detection_model
+        logger.info(f"PSFaceProcessor ready (model={detection_model})")
+
+    def process_frame(
+        self, frame: np.ndarray
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[np.ndarray]]:
+        """
+        Detect faces and compute embeddings for a single camera frame.
+
+        Args:
+            frame: BGR frame from OpenCV (H×W×3, uint8).
+
+        Returns:
+            faces      : List of (x1, y1, x2, y2) bounding boxes in pixel coords.
+            embeddings : Corresponding list of 128-D float32 unit-norm vectors.
+                         Empty lists if no faces detected.
+        """
+        # face_recognition expects RGB
+        rgb = frame[:, :, ::-1]
+
+        # Detect face locations — returns list of (top, right, bottom, left)
+        locations = fr.face_locations(rgb, model=self.detection_model)
+
+        if not locations:
+            return [], []
+
+        # Compute 128-D embeddings for all detected faces at once
+        raw_encodings = fr.face_encodings(rgb, locations)
+
+        faces = []
+        embeddings = []
+
+        for (top, right, bottom, left), enc in zip(locations, raw_encodings):
+            # Convert to (x1, y1, x2, y2) format used throughout the project
+            faces.append((left, top, right, bottom))
+
+            # face_recognition encodings are already unit-norm float64; cast to float32
+            emb = enc.astype(np.float32)
+            norm = np.linalg.norm(emb)
+            if norm > 1e-8:
+                emb = emb / norm
+            embeddings.append(emb)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Detected {len(faces)} face(s)")
+
+        return faces, embeddings
+
+
+# =====================================================================
+# Authorization state machine
+# =====================================================================
+
 class AuthStatus(Enum):
-    """Authorization status"""
-    AUTHORIZED = "AUTHORIZED"
+    AUTHORIZED   = "AUTHORIZED"
     UNAUTHORIZED = "UNAUTHORIZED"
-    UNKNOWN = "UNKNOWN"
+    UNKNOWN      = "UNKNOWN"
 
 
 class FaceRecognizer:
-    """Recognizes faces by matching embeddings against stored database"""
-    
+    """
+    Matches a face embedding against the enrolled user database and
+    maintains a hysteresis state machine to avoid flickering.
+
+    Hysteresis prevents a single bad frame from locking out an authorized
+    user, and requires several consecutive good frames before granting access.
+    """
+
     def __init__(self, user_db, similarity_threshold: float = 0.6):
         """
-        Initialize recognizer
-        
         Args:
-            user_db: UserDatabase instance
-            similarity_threshold: Cosine similarity threshold (0-1)
+            user_db:              UserDatabase instance.
+            similarity_threshold: Cosine similarity required for a match (0–1).
+                                  0.6 is a reasonable starting point; lower values
+                                  are more permissive, higher values are stricter.
         """
         self.user_db = user_db
         self.similarity_threshold = similarity_threshold
-        
-        # Hysteresis state machine
-        self.current_status = AuthStatus.UNKNOWN
-        self.bad_frame_count = 0
+
+        # Hysteresis counters
+        self.current_status  = AuthStatus.UNKNOWN
+        self.bad_frame_count  = 0
         self.good_frame_count = 0
-        self.lock_threshold = 3      # Bad frames to trigger lock
-        self.unlock_threshold = 8    # Good frames to trigger unlock
-        
-        logger.info(f"Recognizer initialized (threshold={similarity_threshold})")
-    
+        self.lock_threshold   = 3   # consecutive bad frames → UNAUTHORIZED
+        self.unlock_threshold = 8   # consecutive good frames → AUTHORIZED
+
+        logger.info(f"Recognizer ready (threshold={similarity_threshold})")
+
     def recognize(self, embedding: np.ndarray) -> dict:
         """
-        Recognize a face from its embedding
-        
+        Match embedding and update authorization state.
+
         Args:
-            embedding: 128-D embedding vector (normalized)
-        
+            embedding: 128-D unit-norm float32 vector.
+
         Returns:
-            Dict with:
-            - 'status': AuthStatus
-            - 'user': Username if recognized
-            - 'confidence': Similarity score (0-1)
-            - 'is_authorized': Boolean
+            {
+              'status':        AuthStatus,
+              'user':          str | None,   # recognized username if AUTHORIZED
+              'confidence':    float,        # best cosine similarity (0–1)
+              'is_authorized': bool,
+            }
         """
         if embedding is None or len(embedding) == 0:
-            return {
-                'status': AuthStatus.UNKNOWN,
-                'user': None,
-                'confidence': 0.0,
-                'is_authorized': False
-            }
-        
-        # Get all users from database
+            return {'status': AuthStatus.UNKNOWN, 'user': None,
+                    'confidence': 0.0, 'is_authorized': False}
+
         users = self.user_db.get_all_users()
-        
         if not users:
-            return {
-                'status': AuthStatus.UNKNOWN,
-                'user': None,
-                'confidence': 0.0,
-                'is_authorized': False
-            }
-        
-        # Find best match
-        best_user = None
+            return {'status': AuthStatus.UNKNOWN, 'user': None,
+                    'confidence': 0.0, 'is_authorized': False}
+
+        # Find best-matching enrolled user
+        best_user       = None
         best_similarity = -1.0
-        
-        for username, stored_embedding in users.items():
-            # Compute cosine similarity
-            similarity = self._cosine_similarity(embedding, stored_embedding)
-            
-            if similarity > best_similarity:
-                best_similarity = similarity
+        for username, stored_emb in users.items():
+            sim = self._cosine_similarity(embedding, stored_emb)
+            if sim > best_similarity:
+                best_similarity = sim
                 best_user = username
-        
-        # Determine authorization with hysteresis
+
+        # Hysteresis state machine
         if best_similarity >= self.similarity_threshold:
             self.good_frame_count += 1
-            self.bad_frame_count = 0
-            
+            self.bad_frame_count   = 0
             if self.good_frame_count >= self.unlock_threshold:
                 self.current_status = AuthStatus.AUTHORIZED
         else:
-            self.bad_frame_count += 1
-            self.good_frame_count = 0
-            
+            self.bad_frame_count  += 1
+            self.good_frame_count  = 0
             if self.bad_frame_count >= self.lock_threshold:
                 self.current_status = AuthStatus.UNAUTHORIZED
-        
+
         return {
-            'status': self.current_status,
-            'user': best_user if self.current_status == AuthStatus.AUTHORIZED else None,
-            'confidence': best_similarity,
-            'is_authorized': self.current_status == AuthStatus.AUTHORIZED
+            'status':        self.current_status,
+            'user':          best_user if self.current_status == AuthStatus.AUTHORIZED else None,
+            'confidence':    best_similarity,
+            'is_authorized': self.current_status == AuthStatus.AUTHORIZED,
         }
-    
+
     def _cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
-        """
-        Compute cosine similarity between two vectors
-        
-        Args:
-            vec1: First vector
-            vec2: Second vector
-        
-        Returns:
-            Similarity score (0-1)
-        """
-        # Ensure normalized
-        norm1 = np.linalg.norm(vec1) + 1e-8
-        norm2 = np.linalg.norm(vec2) + 1e-8
-        
-        vec1_norm = vec1 / norm1
-        vec2_norm = vec2 / norm2
-        
-        similarity = np.dot(vec1_norm, vec2_norm)
-        
-        # Clamp to [0, 1]
-        return max(0.0, min(1.0, similarity))
+        n1 = np.linalg.norm(vec1) + 1e-8
+        n2 = np.linalg.norm(vec2) + 1e-8
+        return float(np.clip(np.dot(vec1 / n1, vec2 / n2), 0.0, 1.0))
 
 
 # =====================================================================
-# User Database
+# User database
 # =====================================================================
-
-import json
-from pathlib import Path
-
 
 class UserDatabase:
-    """Persistent user enrollment database"""
-    
+    """Persistent enrollment store — JSON file with username → 128-D embedding."""
+
+    EMBEDDING_DIM = 128
+
     def __init__(self, db_path: str = "data/users.json"):
-        """
-        Initialize database
-        
-        Args:
-            db_path: Path to JSON database file
-        """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.data = {}
-        
+        self.data: dict = {}
         self._load()
-    
+
     def _load(self):
-        """Load database from file"""
         if self.db_path.exists():
             try:
                 with open(self.db_path, 'r') as f:
-                    data = json.load(f)
-                
-                # Convert embeddings back to numpy arrays
-                for username, embedding_list in data.items():
-                    self.data[username] = np.array(embedding_list, dtype=np.float32)
-                
-                logger.info(f"Loaded {len(self.data)} users from database")
+                    raw = json.load(f)
+                self.data = {
+                    u: np.array(e, dtype=np.float32)
+                    for u, e in raw.items()
+                }
+                logger.info(f"Loaded {len(self.data)} user(s) from {self.db_path}")
             except Exception as e:
                 logger.error(f"Failed to load database: {e}")
                 self.data = {}
         else:
-            logger.info("Creating new database")
-    
+            logger.info("No existing database — starting fresh")
+
     def _save(self):
-        """Save database to file"""
         try:
-            # Convert embeddings to lists for JSON
-            save_data = {}
-            for username, embedding in self.data.items():
-                save_data[username] = embedding.tolist()
-            
             with open(self.db_path, 'w') as f:
-                json.dump(save_data, f, indent=2)
-            
-            logger.info(f"Database saved with {len(self.data)} users")
+                json.dump(
+                    {u: e.tolist() for u, e in self.data.items()},
+                    f, indent=2
+                )
         except Exception as e:
             logger.error(f"Failed to save database: {e}")
-    
+
     def add_user(self, username: str, embedding: np.ndarray):
-        """
-        Add or update user with embedding
-        
-        Args:
-            username (str): User identifier
-            embedding (np.ndarray): 128-D embedding vector
-        """
-        if embedding is None or len(embedding) != 128:
-            raise ValueError("Embedding must be 128-D")
-        
-        # Normalize embedding
-        embedding = embedding.astype(np.float32)
-        embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-        
-        self.data[username] = embedding
+        if embedding is None or len(embedding) != self.EMBEDDING_DIM:
+            raise ValueError(f"Embedding must be {self.EMBEDDING_DIM}-D")
+        emb = embedding.astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm > 1e-8:
+            emb = emb / norm
+        self.data[username] = emb
         self._save()
-        logger.info(f"User '{username}' added")
-    
+        logger.info(f"User '{username}' enrolled")
+
     def get_user(self, username: str) -> Optional[np.ndarray]:
-        """
-        Get user embedding
-        
-        Args:
-            username (str): User identifier
-        
-        Returns:
-            Embedding array or None if not found
-        """
         return self.data.get(username)
-    
+
     def get_all_users(self) -> dict:
-        """
-        Get all users
-        
-        Returns:
-            Dict of {username: embedding}
-        """
         return self.data.copy()
-    
+
     def remove_user(self, username: str):
-        """Remove user from database"""
         if username in self.data:
             del self.data[username]
             self._save()
             logger.info(f"User '{username}' removed")
-    
+
     def clear_all(self):
-        """Clear all users (use with caution!)"""
         self.data.clear()
         self._save()
         logger.info("Database cleared")
