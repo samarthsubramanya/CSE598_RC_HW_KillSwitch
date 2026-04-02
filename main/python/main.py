@@ -88,7 +88,12 @@ class FaceRecognitionSystem:
 
         logger.info("Initializing face recognizer...")
         self.processor  = PSFaceProcessor(detection_model="hog")
-        self.recognizer = FaceRecognizer(self.db, similarity_threshold=0.6)
+        self.recognizer = FaceRecognizer(
+            self.db, similarity_threshold=0.6, fpga=self.fpga
+        )
+
+        # Pre-load enrolled embeddings into FPGA BRAM
+        self.fpga.update_database(self.db.get_all_users())
 
         logger.info("System ready")
 
@@ -237,6 +242,8 @@ class FaceRecognitionSystem:
             if norm > 1e-8:
                 avg = avg / norm
             self.db.add_user(username, avg)
+            # Sync updated database to FPGA BRAM
+            self.fpga.update_database(self.db.get_all_users())
             logger.info(f"Enrolled '{username}' successfully")
         else:
             logger.info("Enrollment cancelled")

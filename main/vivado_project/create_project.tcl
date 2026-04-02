@@ -47,6 +47,24 @@ add_files -norecurse {
 }
 # NOTE: cnn_engine.v and haar_detector.v are excluded — they are stubs only.
 
+# --- HLS IP: cosine_match_accel -------------------------------------------
+# Build HLS IP first (run once before this script):
+#   cd ../hls && vivado_hls -f run_hls.tcl
+#
+# Then add the exported IP to the repository:
+set hls_ip_path "../hls/cosine_match_ip"
+if {[file exists $hls_ip_path]} {
+    set_property ip_repo_paths [concat \
+        [get_property ip_repo_paths [current_project]] \
+        $hls_ip_path \
+    ] [current_project]
+    update_ip_catalog -quiet
+    puts "INFO: cosine_match_accel IP added from $hls_ip_path"
+} else {
+    puts "WARNING: HLS IP not found at $hls_ip_path"
+    puts "         Run 'cd ../hls && vivado_hls -f run_hls.tcl' first."
+}
+
 # Add Digilent IP repo if it exists locally
 set digilent_ip_path "../../vivado-library/ip"
 if {[file exists $digilent_ip_path]} {
@@ -144,11 +162,24 @@ set_property -dict [list \
 # Import hdmi_stream_mux as a module reference block
 create_bd_cell -type module -reference hdmi_stream_mux hdmi_mux_0
 
-# --- AXI Interconnect (GP0 → GPIO + VDMA) ------------------------------------
+# --- HLS cosine_match_accel IP -----------------------------------------------
+# Instantiated only if the IP was found in the repo above.
+# Interface: AXI-Lite slave (control + query embedding)
+#          + AXI4 master  (DB reads from DDR via HP0)
+if {[llength [get_ipdefs pynq_z2:face_recog:cosine_match_accel:1.0]] > 0} {
+    create_bd_cell -type ip \
+        -vlnv pynq_z2:face_recog:cosine_match_accel:1.0 \
+        cosine_match_accel_0
+    puts "INFO: cosine_match_accel_0 instantiated"
+} else {
+    puts "WARNING: cosine_match_accel IP not available — skip instantiation"
+}
+
+# --- AXI Interconnect (GP0 → GPIO + VDMA + cosine_match_accel) ---------------
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_0
 set_property -dict [list \
     CONFIG.NUM_SI {1} \
-    CONFIG.NUM_MI {2} \
+    CONFIG.NUM_MI {3} \
 ] [get_bd_cells axi_ic_0]
 
 # --- Processor System Reset ---------------------------------------------------
@@ -196,6 +227,23 @@ connect_bd_intf_net [get_bd_intf_pins axi_ic_0/M00_AXI] \
 connect_bd_intf_net [get_bd_intf_pins axi_ic_0/M01_AXI] \
                     [get_bd_intf_pins axi_vdma_0/S_AXI_LITE]
 
+# Interconnect → cosine_match_accel AXI-Lite (control + query registers)
+if {[get_bd_cells -quiet cosine_match_accel_0] ne ""} {
+    connect_bd_intf_net [get_bd_intf_pins axi_ic_0/M02_AXI] \
+                        [get_bd_intf_pins cosine_match_accel_0/s_axi_CTRL]
+
+    # cosine_match_accel AXI4 master → HP0 (DMA reads enrolled DB from DDR)
+    # We share HP0 with VDMA using a second AXI interconnect slave port
+    connect_bd_intf_net [get_bd_intf_pins cosine_match_accel_0/m_axi_DB] \
+                        [get_bd_intf_pins processing_system7_0/S_AXI_HP0]
+
+    # Clock + reset for cosine_match_accel
+    connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0] \
+                   [get_bd_pins cosine_match_accel_0/ap_clk]
+    connect_bd_net [get_bd_pins proc_sys_reset_0/peripheral_aresetn] \
+                   [get_bd_pins cosine_match_accel_0/ap_rst_n]
+}
+
 # VDMA DMA → HP0 (DDR access for frame reads)
 connect_bd_intf_net [get_bd_intf_pins axi_vdma_0/M_AXI_MM2S] \
                     [get_bd_intf_pins processing_system7_0/S_AXI_HP0]
@@ -239,8 +287,9 @@ set_property name led [get_bd_ports led_0]
 # Address assignments
 # =============================================================================
 # GP0 sees:
-#   axi_gpio_0  at 0x41200000  (4 KB)
-#   axi_vdma_0  at 0x43000000  (64 KB)
+#   axi_gpio_0           at 0x41200000  (4 KB)
+#   axi_vdma_0           at 0x43000000  (64 KB)
+#   cosine_match_accel_0 at 0x43C00000  (64 KB)
 assign_bd_address [get_bd_addr_segs axi_gpio_0/S_AXI/Reg]
 assign_bd_address [get_bd_addr_segs axi_vdma_0/S_AXI_LITE/Reg]
 
@@ -248,6 +297,12 @@ set_property offset 0x41200000 \
     [get_bd_addr_segs {processing_system7_0/Data/SEG_axi_gpio_0_Reg}]
 set_property offset 0x43000000 \
     [get_bd_addr_segs {processing_system7_0/Data/SEG_axi_vdma_0_Reg}]
+
+if {[get_bd_cells -quiet cosine_match_accel_0] ne ""} {
+    assign_bd_address [get_bd_addr_segs cosine_match_accel_0/s_axi_CTRL/Reg]
+    set_property offset 0x43C00000 \
+        [get_bd_addr_segs {processing_system7_0/Data/SEG_cosine_match_accel_0_Reg}]
+}
 
 # HP0 sees full DDR (2GB)
 assign_bd_address [get_bd_addr_segs processing_system7_0/S_AXI_HP0/HP0_DDR_LOWOCM]

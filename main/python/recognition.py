@@ -126,20 +126,27 @@ class FaceRecognizer:
     Matches a face embedding against the enrolled user database and
     maintains a hysteresis state machine to avoid flickering.
 
+    When an FPGAInterface is supplied, the cosine similarity search runs
+    on the FPGA cosine_match_accel HLS core (128-D dot product on DSP48
+    blocks, ~5 µs).  Falls back to CPU if the FPGA IP is unavailable.
+
     Hysteresis prevents a single bad frame from locking out an authorized
     user, and requires several consecutive good frames before granting access.
     """
 
-    def __init__(self, user_db, similarity_threshold: float = 0.6):
+    def __init__(self, user_db, similarity_threshold: float = 0.6,
+                 fpga=None):
         """
         Args:
             user_db:              UserDatabase instance.
             similarity_threshold: Cosine similarity required for a match (0–1).
-                                  0.6 is a reasonable starting point; lower values
-                                  are more permissive, higher values are stricter.
+            fpga:                 FPGAInterface instance (optional).
+                                  If provided and cosine_match_accel is present,
+                                  hardware accelerated matching is used.
         """
         self.user_db = user_db
         self.similarity_threshold = similarity_threshold
+        self.fpga = fpga
 
         # Hysteresis counters
         self.current_status  = AuthStatus.UNKNOWN
@@ -153,6 +160,8 @@ class FaceRecognizer:
     def recognize(self, embedding: np.ndarray) -> dict:
         """
         Match embedding and update authorization state.
+
+        Uses FPGA cosine_match_accel if available, otherwise CPU fallback.
 
         Args:
             embedding: 128-D unit-norm float32 vector.
@@ -174,14 +183,20 @@ class FaceRecognizer:
             return {'status': AuthStatus.UNKNOWN, 'user': None,
                     'confidence': 0.0, 'is_authorized': False}
 
-        # Find best-matching enrolled user
-        best_user       = None
-        best_similarity = -1.0
-        for username, stored_emb in users.items():
-            sim = self._cosine_similarity(embedding, stored_emb)
-            if sim > best_similarity:
-                best_similarity = sim
-                best_user = username
+        # --- FPGA-accelerated cosine match (uses DSP48 MAC array) ---
+        if self.fpga is not None and getattr(self.fpga, '_cm', None) is not None:
+            best_user, best_similarity = self.fpga.run_cosine_match(embedding)
+            if best_user is None:
+                best_similarity = 0.0
+        else:
+            # --- CPU fallback ---
+            best_user       = None
+            best_similarity = -1.0
+            for username, stored_emb in users.items():
+                sim = self._cosine_similarity(embedding, stored_emb)
+                if sim > best_similarity:
+                    best_similarity = sim
+                    best_user = username
 
         # Hysteresis state machine
         if best_similarity >= self.similarity_threshold:

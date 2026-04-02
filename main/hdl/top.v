@@ -14,7 +14,10 @@
  *   - v_tc                   : Video timing controller for camera stream
  *   - dvi2rgb                : HDMI IN deserializer (Digilent IP, ADV7612 side)
  *   - rgb2dvi                : HDMI OUT serializer  (Digilent IP, ADV7511 side)
- *   - hdmi_stream_mux (this) : Custom kill-switch mux (auth_flag selects source)
+ *   - hdmi_stream_mux (RTL)  : Custom kill-switch mux (auth_flag selects source)
+ *   - cosine_match_accel(HLS): 128-D dot-product search on 8×DSP48 MAC array
+ *                              PS sends query embedding → FPGA searches BRAM →
+ *                              returns (best_user_idx, similarity_score) in ~5 µs
  *
  * Kill Switch Logic (implemented in hdmi_mux.v):
  *   auth_flag = 1  →  pass HDMI IN  → HDMI OUT  (authorized user present)
