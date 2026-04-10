@@ -20,7 +20,7 @@ Fixed-point encoding (Q2.14):
   float → int16: round(f * 2**14)   clamped to [-32768, 32767]
   int16 → float: i / 2**14
 """
-
+start
 import numpy as np
 import logging
 import time
@@ -57,6 +57,22 @@ _CM_START    = 0x1
 _CM_DONE     = 0x2
 _CM_IDLE     = 0x4
 
+# Sprite compositor AXI-Lite offsets (axi_gpio_sprite_0 at 0x43C10000)
+# Must match _REG_* constants in graphics_api.py
+_SP_VISIBLE  = 0x00
+_SP_ALPHA    = 0x04
+_SP_X0       = 0x08
+_SP_Y0       = 0x0C
+_SP_X1       = 0x10
+_SP_Y1       = 0x14
+_SP_WR_EN    = 0x18
+_SP_WR_ADDR  = 0x1C
+_SP_WR_DATA  = 0x20
+
+# BRAM canvas limits (must match `define in hdmi_mux.v)
+_SPRITE_MAX_W = 512
+_SPRITE_MAX_H = 128
+
 
 class FPGAInterface:
     """
@@ -81,6 +97,7 @@ class FPGAInterface:
         self._init_gpio()
         self._init_cosine_match()
         self._init_video()
+        self._init_sprite()
 
         self.set_authorization_status(False)
         logger.info("FPGA interface ready")
@@ -98,6 +115,26 @@ class FPGAInterface:
         except AttributeError:
             logger.error("axi_gpio_0 not found in overlay")
             raise
+
+    def _init_sprite(self):
+        """Bind to the sprite compositor AXI-Lite register block."""
+        if not PYNQ_AVAILABLE:
+            self._sprite_ctrl = None
+            return
+        try:
+            # The Vivado block design must include an AXI GPIO (or custom AXI-Lite
+            # slave) called 'axi_gpio_sprite_0' mapped to 0x43C10000.
+            # See create_project.tcl for the instantiation.
+            self._sprite_ctrl = self.overlay.axi_gpio_sprite_0
+            # Ensure compositor is invisible at reset
+            self._sprite_ctrl.write(_SP_VISIBLE, 0)
+            logger.info("Sprite compositor AXI block bound")
+        except AttributeError:
+            logger.warning(
+                "axi_gpio_sprite_0 not found in overlay — "
+                "sprite compositor will be simulated in software only"
+            )
+            self._sprite_ctrl = None
 
     def _init_cosine_match(self):
         """Bind to the HLS cosine match accelerator."""
@@ -289,12 +326,92 @@ class FPGAInterface:
             logger.error(f"VDMA frame write failed: {e}")
 
     # ------------------------------------------------------------------
+    # Sprite compositor low-level register access
+    # ------------------------------------------------------------------
+
+    def sprite_ctrl_write(self, offset: int, value: int):
+        """
+        Write a 32-bit value to a sprite compositor AXI-Lite register.
+
+        Called by HardwareGraphicsAPI; not intended for direct use.
+
+        Args:
+            offset: Byte offset within the sprite AXI-Lite address space.
+            value:  32-bit integer to write.
+        """
+        if not PYNQ_AVAILABLE or self._sprite_ctrl is None:
+            if self.verbose:
+                logger.debug("[Mock] sprite_ctrl[0x%02X] = 0x%X", offset, value)
+            return
+        try:
+            self._sprite_ctrl.write(offset, int(value) & 0xFFFFFFFF)
+        except Exception as e:
+            logger.error("sprite_ctrl.write(0x%02X) failed: %s", offset, e)
+
+    def sprite_ctrl_read(self, offset: int) -> int:
+        """
+        Read a 32-bit value from a sprite compositor AXI-Lite register.
+
+        Args:
+            offset: Byte offset within the sprite AXI-Lite address space.
+
+        Returns:
+            32-bit register value, or 0 if the block is unavailable.
+        """
+        if not PYNQ_AVAILABLE or self._sprite_ctrl is None:
+            return 0
+        try:
+            return int(self._sprite_ctrl.read(offset))
+        except Exception as e:
+            logger.error("sprite_ctrl.read(0x%02X) failed: %s", offset, e)
+            return 0
+
+    def batch_sprite_write(self, pixels: np.ndarray):
+        """
+        Bulk-write a sprite pixel array to the FPGA BRAM.
+
+        This method iterates over the pixel array and performs
+        the three-step write protocol (addr → data → en) per pixel.
+        It is called by HardwareGraphicsAPI._upload_pixels_fast().
+
+        Args:
+            pixels: NumPy array of shape (H, W, 3) dtype=uint8 in RGB order.
+                    Height and width must not exceed hardware BRAM limits.
+        """
+        if not PYNQ_AVAILABLE or self._sprite_ctrl is None:
+            if self.verbose:
+                logger.debug("[Mock] batch_sprite_write %s", pixels.shape)
+            return
+
+        h, w = pixels.shape[:2]
+        h = min(h, _SPRITE_MAX_H)
+        w = min(w, _SPRITE_MAX_W)
+
+        sc = self._sprite_ctrl
+        addr = 0
+        for row in range(h):
+            for col in range(w):
+                r, g, b = int(pixels[row, col, 0]), int(pixels[row, col, 1]), int(pixels[row, col, 2])
+                # Remap (0,0,0) to magic transparent value — same logic as graphics_api._rgb_to_hw
+                if r == 0 and g == 0 and b == 0:
+                    hw_px = 0x010101
+                else:
+                    hw_px = (r << 16) | (g << 8) | b
+                sc.write(_SP_WR_ADDR, addr)
+                sc.write(_SP_WR_DATA, hw_px)
+                sc.write(_SP_WR_EN,   1)
+                addr += 1
+        sc.write(_SP_WR_EN, 0)  # de-assert write-enable
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     def shutdown(self):
         try:
             self.set_authorization_status(False)
+            # Disable sprite compositor
+            self.sprite_ctrl_write(_SP_VISIBLE, 0)
             if PYNQ_AVAILABLE:
                 if self._hdmi_in:
                     self._hdmi_in.stop()

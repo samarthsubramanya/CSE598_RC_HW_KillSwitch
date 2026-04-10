@@ -39,6 +39,7 @@ from fpga_interface import FPGAInterface
 from camera_interface import NetworkCamera, USBCamera
 from recognition import PSFaceProcessor, FaceRecognizer, AuthStatus, UserDatabase
 from hdmi_overlay import OverlayGenerator
+from graphics_api import HardwareGraphicsAPI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,11 +63,13 @@ class FaceRecognitionSystem:
         self.recognizer = None
         self.db         = None
         self.overlay_gen = OverlayGenerator()
+        self.gfx        = None   # HardwareGraphicsAPI (set after FPGA init)
 
         self.running      = False
         self.mode         = "recognition"
         self.current_user = None
         self.frame_count  = 0
+        self._last_auth_state = None  # track transitions to avoid redundant writes
 
         logger.info(f"Face Recognition Kill Switch")
         logger.info(f"Bitstream: {self.bitstream_path} | Camera: {camera_source}")
@@ -79,6 +82,15 @@ class FaceRecognitionSystem:
         """Initialize all components."""
         logger.info("Loading bitstream and starting HDMI pipeline...")
         self._setup_fpga()
+
+        # Graphics API needs the FPGA interface ready first
+        self.gfx = HardwareGraphicsAPI(
+            fpga_interface=self.fpga,
+            screen_w=1280,
+            screen_h=720,
+            default_alpha=14,
+            default_duration=5.0,
+        )
 
         logger.info("Connecting to camera...")
         self._setup_camera()
@@ -169,6 +181,31 @@ class FaceRecognitionSystem:
                 # Authorization decision → FPGA kill switch
                 is_authorized = (self.recognizer.current_status == AuthStatus.AUTHORIZED)
                 self.fpga.set_authorization_status(is_authorized)
+
+                # ── Graphics API: show timed banner on authorization state change ──
+                if is_authorized != self._last_auth_state:
+                    self._last_auth_state = is_authorized
+                    if is_authorized:
+                        # Determine who was recognized (first authorized face)
+                        recognized_user = None
+                        recognized_conf = 0.0
+                        for _box, status in recognition_results:
+                            if status.get('is_authorized', False):
+                                recognized_user = status.get('user', 'User')
+                                recognized_conf = status.get('confidence', 0.0)
+                                break
+                        self.gfx.show_authorized_screen(
+                            username=recognized_user or 'User',
+                            confidence=recognized_conf,
+                            duration=5.0,
+                            position='top',
+                        )
+                    else:
+                        # Only show the denied banner briefly
+                        self.gfx.show_unauthorized_screen(
+                            duration=2.5,
+                            position='top',
+                        )
 
                 # Push annotated camera frame to VDMA (displayed when unauthorized)
                 annotated = self.overlay_gen.draw_boxes_and_status(
@@ -276,6 +313,8 @@ class FaceRecognitionSystem:
     def cleanup(self):
         logger.info("Shutting down...")
         self.running = False
+        if self.gfx:
+            self.gfx.hide()
         if self.camera:
             self.camera.disconnect()
         if self.fpga:
@@ -293,6 +332,7 @@ class _MockFPGAInterface:
 
     def __init__(self):
         logger.warning("Mock FPGA interface active (no hardware)")
+        self._sprite_ctrl = None
 
     def set_authorization_status(self, is_authorized: bool):
         logger.info(f"[Mock] Kill-switch → {'AUTHORIZED' if is_authorized else 'UNAUTHORIZED'}")
@@ -301,6 +341,18 @@ class _MockFPGAInterface:
         # Show the annotated frame locally for debugging
         cv2.imshow("Camera Feed (Mock)", cv2.resize(frame, (640, 360)))
         cv2.waitKey(1)
+
+    def update_database(self, embeddings_dict: dict):
+        logger.info("[Mock] update_database (%d users)", len(embeddings_dict))
+
+    def sprite_ctrl_write(self, offset: int, value: int):
+        logger.debug("[Mock] sprite_ctrl[0x%02X] = 0x%X", offset, value)
+
+    def sprite_ctrl_read(self, offset: int) -> int:
+        return 0
+
+    def batch_sprite_write(self, pixels: np.ndarray):
+        logger.debug("[Mock] batch_sprite_write shape=%s", pixels.shape)
 
     def shutdown(self):
         cv2.destroyAllWindows()
