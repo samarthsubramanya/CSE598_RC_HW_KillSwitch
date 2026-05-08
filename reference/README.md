@@ -1,21 +1,22 @@
+
 # Face Authentication System - CPU Reference Implementation
 
 A pure Python implementation of the FPGA face authentication system that runs on any CPU. This serves as the reference/prototype implementation before deploying to PYNQ-Z2.
 
-## 📋 Overview
+##  Overview
 
-This is a modular, easy-to-understand implementation of the face authentication system described in `PLAN.md`. It:
+This is a modular, easy-to-understand implementation of the face authentication system described. It:
 
-- ✅ Runs on any computer (CPU-based)
-- ✅ Supports live camera input (webcam or IP camera)
-- ✅ Performs face detection and embedding computation
-- ✅ Implements user enrollment and recognition
-- ✅ Uses hysteresis for robust authorization decisions
-- ✅ Shows real-time visual feedback (or console output for headless mode)
+-  Runs on any computer (CPU-based)
+-  Supports live camera input (webcam or IP camera)
+-  Performs face detection and embedding computation
+-  Implements user enrollment and recognition
+-  Uses hysteresis for robust authorization decisions
+-  Shows real-time visual feedback (or console output for headless mode)
 
 Later, specific layers can be replaced with PYNQ APIs for FPGA acceleration.
 
-## 🎯 Architecture
+##  Architecture
 
 ```
 Camera Input
@@ -31,7 +32,7 @@ Camera Input
 [display.py] → Show status (GUI or console)
 ```
 
-## 📁 File Structure
+##  File Structure
 
 ```
 reference/
@@ -48,7 +49,7 @@ reference/
     └── users.json        # Stored user embeddings (auto-created)
 ```
 
-## 🚀 Setup
+##  Setup
 
 ### 1. Install Dependencies
 
@@ -57,20 +58,10 @@ cd reference
 pip install -r requirements.txt
 ```
 
-### 2. (Optional) Download Pretrained Face Embedding Model
-
-For better accuracy, download OpenFace model:
-
-```bash
-mkdir -p models
-cd models
-wget https://storage.cmuscs.org/openface-models/nn4.small2.v1.t7
-cd ..
-```
 
 If you skip this, the system will use a dummy model for demo purposes.
 
-## 🎮 Quick Start
+##  Quick Start
 
 ### Interactive Menu Mode (Default)
 
@@ -104,7 +95,7 @@ Perfect for running on a server or headless system.
 python main.py --mode enroll --user "john_doe"
 ```
 
-## 📌 Keyboard Controls (During Recognition)
+##  Keyboard Controls (During Recognition)
 
 | Key | Action |
 |-----|--------|
@@ -114,7 +105,7 @@ python main.py --mode enroll --user "john_doe"
 | `d` | Delete user |
 | `c` | Clear database |
 
-## 🔐 How It Works
+##  How It Works
 
 ### Recognition Flow
 
@@ -127,9 +118,9 @@ python main.py --mode enroll --user "john_doe"
 
 ### Authorization States
 
-- **✅ AUTHORIZED**: User recognized (face matches stored embedding above threshold)
-- **❌ UNAUTHORIZED**: User not recognized or below confidence threshold
-- **⚠️ NO_FACE**: No face detected in frame
+- ** AUTHORIZED**: User recognized (face matches stored embedding above threshold)
+- ** UNAUTHORIZED**: User not recognized or below confidence threshold
+- ** NO_FACE**: No face detected in frame
 
 ### Hysteresis Example
 
@@ -169,7 +160,7 @@ system = FaceAuthenticationSystem(
 )
 ```
 
-## 🎥 Camera Input Options
+##  Camera Input Options
 
 ### Default Webcam
 
@@ -189,7 +180,7 @@ Example with DroidCam:
 python main.py --camera "http://192.168.1.100:8080/video"
 ```
 
-## 📊 Testing
+##  Testing
 
 ### Without Real Camera
 
@@ -203,14 +194,14 @@ camera = CameraHandler("test_video.mp4")  # Instead of camera source
 
 When pretrained model is not available, system uses dummy embeddings for testing the pipeline.
 
-## 📈 Performance Notes
+##  Performance Notes
 
 - **CPU Performance**: ~15-30 FPS on modern CPU (depending on model)
 - **Latency**: ~100-300ms per frame (detection + embedding)
 - **Memory**: ~500MB-1GB
 - **Embedding Computation**: Bottleneck (can be accelerated on FPGA)
 
-## 🔄 Migration to PYNQ
+##  Migration to PYNQ
 
 To adapt this for PYNQ-Z2:
 
@@ -228,7 +219,7 @@ pynq_version/
 └── ... (other files same)
 ```
 
-## 🐛 Troubleshooting
+##  Troubleshooting
 
 ### "Camera not found"
 
@@ -254,7 +245,7 @@ pynq_version/
 - Disable GUI (`--headless`)
 - Use simpler face detection (Haar Cascade)
 
-## 📝 Database Format
+##  Database Format
 
 User embeddings are stored in `data/users.json`:
 
@@ -273,7 +264,7 @@ User embeddings are stored in `data/users.json`:
 }
 ```
 
-## 🎓 Understanding the Code
+##  Understanding the Code
 
 ### Key Concepts
 
@@ -290,16 +281,16 @@ User embeddings are stored in `data/users.json`:
 - `recognition.py`: State machine logic
 - `user_db.py`: Persistent storage
 
-## 📚 Next Steps
+##  Next Steps
 
-1. ✅ Run and test on your computer
-2. ✅ Enroll yourself and test recognition
-3. ✅ Adjust thresholds for your environment
-4. ✅ When ready, port to PYNQ using FPGA-accelerated components
+1.  Run and test on your computer
+2.  Enroll yourself and test recognition
+3.  Adjust thresholds for your environment
+4.  When ready, port to PYNQ using FPGA-accelerated components
 
-## 📖 References
+##  References
 
-- [PLAN.md](../PLAN.md) - Full system design
+
 - OpenCV Documentation: https://docs.opencv.org/
 - PYNQ Documentation: https://pynq.readthedocs.io/
 
