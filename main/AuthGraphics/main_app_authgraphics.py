@@ -15,22 +15,22 @@ VIDEO_PATH                = "http://192.168.0.114:4747/video"
 AUTHORIZED_EMBEDDINGS_DIR = "authorized_embeddings"
 WIDTH, HEIGHT             = 1280, 720
 HDMI_FPS                  = 20.0
-HDMI_INTERVAL             = 1 / 12        # ~12 FPS processing budget
+HDMI_INTERVAL             = 1 / 12        # ~12 FPS limit
 
 DETECTION_SCALE  = 0.25                   # Haar runs on a downscaled frame
 DETECTION_EVERY  = 2
 MAX_FACES        = 1
-MATCH_THRESHOLD  = 0.70                   # cosine; OpenFace is more permissive than dlib
+MATCH_THRESHOLD  = 0.70                   #
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("HDMI_Face_Detect")
 
-# --- Bitstream + cosine accelerator ------------------------------------------
+
 ol = Overlay(BITSTREAM_PATH)
 cs = CosineSimilarity(bitfile=None, base_addr=0x4000_0000)
 
-# --- Haar cascade (PS detection) ---------------------------------------------
+
 def find_cascade():
     cands = []
     cands += glob.glob("/usr/share/opencv*/haarcascades/haarcascade_frontalface_default.xml")
@@ -55,7 +55,7 @@ detector = cv2.CascadeClassifier(CASCADE_PATH)
 if detector.empty():
     raise RuntimeError("Failed to load Haar cascade")
 
-# --- OpenFace embedder (PS, 128-D, L2-normalized) ----------------------------
+
 EMBED_FILE = "openface.nn4.small2.v1.t7"
 EMBED_URLS = [
     "https://github.com/pyannote/pyannote-data/raw/master/openface.nn4.small2.v1.t7",
@@ -114,7 +114,7 @@ def detect_and_embed(frame_bgr):
     return out
 
 
-# --- Authorized embeddings ---------------------------------------------------
+
 def load_authorized_embeddings(directory: str):
     embeddings = []
     emb_dir = Path(directory)
@@ -126,14 +126,12 @@ def load_authorized_embeddings(directory: str):
     return embeddings
 
 
-# --- Threaded camera grabber -------------------------------------------------
+
 class VideoFrameGrabber(threading.Thread):
     def __init__(self, path, fallback_img_path="ASUS.png"):
         super().__init__(daemon=True)
         self.cap = cv2.VideoCapture(path)
-        # Keep only the newest frame in the backend buffer (FFmpeg/V4L2);
-        # without this, IP-camera streams build up latency when the
-        # consumer is slower than the producer.
+        
         try:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -145,10 +143,7 @@ class VideoFrameGrabber(threading.Thread):
         log.info("VFG Init")
 
     def run(self):
-        # Drain frames at the camera's native rate — cap.read() blocks until
-        # the next frame arrives, so this naturally paces itself without any
-        # explicit sleep. The processing loop downstream still throttles to
-        # HDMI_INTERVAL via the latest()-grab pattern.
+        
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
@@ -170,7 +165,7 @@ class VideoFrameGrabber(threading.Thread):
             return self._frame.copy() if self._frame is not None else None
 
 
-# =============================================================================
+
 auth_embs = load_authorized_embeddings(AUTHORIZED_EMBEDDINGS_DIR)
 grabber   = VideoFrameGrabber(VIDEO_PATH)
 grabber.start()
@@ -197,7 +192,7 @@ try:
             continue
         frame_count += 1
 
-        # ---- A. Detection + embedding (throttled) ----------------------------
+       
         if frame_count % DETECTION_EVERY == 0:
             detections = detect_and_embed(frame)
             last_encodings = [emb for _, emb in detections]
@@ -209,7 +204,7 @@ try:
                 match, cos_ref = cs.compare(a, b, threshold=1.0)
                 log.info("No User Found!")
 
-        # ---- B. PL cosine matching ------------------------------------------
+        
         for cam_emb in last_encodings:
             cam_emb = cam_emb.astype(np.float32)
             for auth_emb in auth_embs:
